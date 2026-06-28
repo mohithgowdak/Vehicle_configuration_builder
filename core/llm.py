@@ -139,101 +139,205 @@ def _normalize_feature(raw: str) -> str:
     return raw
 
 
-# ---------- Q&A for decoded .par files ----------
+# ---------- AI query against decoded .par data ----------
 
-_QA_SYSTEM = (
-    "You are an expert automotive ECU configuration analyst. "
-    "The user has loaded a .par ECU configuration file. "
-    "Here is the fully decoded configuration:\n\n"
-    "{context}\n\n"
-    "Answer the user's question about this configuration clearly and concisely. "
-    "Only use information from the decoded configuration above. "
-    "If something is not in the data, say so honestly."
-)
+_AI_QUERY_SYSTEM = """\
+You are an expert automotive ECU configuration analyst.
+The user has loaded a .par configuration file. You have access to the full decoded parameter list below.
+
+Each parameter entry is a JSON object with these fields:
+  qualifier  – CDD identifier, e.g. "VCD_CGW_HVAC_Control.Fan_Speed"
+  field      – last segment of qualifier, e.g. "Fan_Speed"
+  hex        – raw hex from .par file
+  decimal    – hex converted to integer
+  domain     – write-command group, e.g. "CGW_HVAC Control Write"
+  fragment   – preset name, e.g. "HVAC: Auto mode"
+  feature    – human-readable feature name
+
+DECODED PARAMETERS:
+{params_json}
+
+SESSION INFO:
+{session_json}
+
+INSTRUCTIONS:
+Analyse the user query and return STRICT JSON with this schema:
+{{
+  "query_type": "keyword_filter" | "part_number" | "show_all" | "session_info" | "general",
+  "keywords":   ["word1", ...],
+  "matched_qualifiers": ["qualifier1", ...],
+  "answer": "human-readable reply (markdown OK)"
+}}
+
+Rules:
+- "keyword_filter": user is looking for a specific subsystem or feature by name (e.g. "hvac", "timer", "brake", "can").
+  → search qualifier, field, domain, fragment for the keywords.
+  → populate matched_qualifiers with every qualifier that contains any keyword (case-insensitive).
+  → answer should summarise what you found with hex and decimal values.
+- "part_number": query contains a part number pattern (letters + dots/digits like A.034.447.29.27 or A0344472927).
+  → set matched_qualifiers to [] (app handles part-number lookup separately).
+  → answer: "Looking up part number …"
+- "show_all": user wants to see everything ("show all", "list all", "all parameters").
+  → matched_qualifiers = [] (app will show full table).
+  → answer: brief confirmation.
+- "session_info": user asks about ECU, variant, version, app name.
+  → matched_qualifiers = [].
+  → answer using session info above.
+- "general": anything else — answer from the parameter data.
+  → populate matched_qualifiers if relevant.
+
+IMPORTANT: matched_qualifiers must be exact qualifier strings from the list above. Never invent qualifiers.
+"""
+
+_AI_RESPONSE_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "query_type":          {"type": "string"},
+        "keywords":            {"type": "array",  "items": {"type": "string"}},
+        "matched_qualifiers":  {"type": "array",  "items": {"type": "string"}},
+        "answer":              {"type": "string"},
+    },
+    "required": ["query_type", "matched_qualifiers", "answer"],
+}
 
 
+def ai_query(
+    question: str,
+    decoded_params: list[dict],   # list of dicts with qualifier/field/hex/decimal/domain/fragment/feature
+    session_info: dict,
+    model: str = "qwen2.5:7b",
+    host: str | None = None,
+) -> tuple[str, list[str], str, str]:
+    """
+    Send query + full decoded data to Ollama.
+    Returns (answer, matched_qualifiers, query_type, source).
+    Falls back to deterministic logic if Ollama unavailable.
+    """
+    result = _try_ollama_ai_query(question, decoded_params, session_info, model, host)
+    if result is not None:
+        return result["answer"], result["matched_qualifiers"], result["query_type"], "ollama"
+
+    # Deterministic fallback
+    return _fallback_ai_query(question, decoded_params, session_info)
+
+
+def _try_ollama_ai_query(
+    question: str,
+    decoded_params: list[dict],
+    session_info: dict,
+    model: str,
+    host: str | None,
+) -> dict | None:
+    if OllamaClient is None:
+        return None
+    try:
+        # Keep params compact — only include fields the model needs
+        compact = [
+            {
+                "qualifier": p["qualifier"],
+                "field":     p["field"],
+                "hex":       p["hex"],
+                "decimal":   p["decimal"],
+                "domain":    p.get("domain", ""),
+                "fragment":  p.get("fragment", ""),
+                "feature":   p.get("feature", ""),
+            }
+            for p in decoded_params
+        ]
+        system = _AI_QUERY_SYSTEM.format(
+            params_json=json.dumps(compact, indent=2),
+            session_json=json.dumps(session_info, indent=2),
+        )
+        client = OllamaClient(host=host) if host else OllamaClient()
+        resp = client.chat(
+            model=model,
+            messages=[
+                {"role": "system", "content": system},
+                {"role": "user",   "content": question},
+            ],
+            format=_AI_RESPONSE_SCHEMA,
+            options={"temperature": 0},
+        )
+        data = json.loads(resp["message"]["content"])
+        # Validate matched_qualifiers are real qualifiers
+        valid_qs = {p["qualifier"] for p in decoded_params}
+        data["matched_qualifiers"] = [q for q in data.get("matched_qualifiers", []) if q in valid_qs]
+        return data
+    except Exception:
+        return None
+
+
+def _fallback_ai_query(
+    question: str,
+    decoded_params: list[dict],
+    session_info: dict,
+) -> tuple[str, list[str], str, str]:
+    """Rule-based fallback when Ollama is not available."""
+    q = question.lower()
+    valid_qs = {p["qualifier"] for p in decoded_params}
+
+    # show_all
+    if any(w in q for w in ("all", "everything", "full", "list", "summary", "show", "complete")):
+        lines = [f"- **{p['field']}** (`{p['qualifier']}`): hex `{p['hex']}` → **{p['decimal']}**"
+                 for p in decoded_params]
+        return "**All parameters:**\n\n" + "\n".join(lines), [], "show_all", "fallback"
+
+    # session_info
+    if any(w in q for w in ("variant", "ecu", "version", "header", "app", "session", "cbf")):
+        lines = [f"- **{k}**: {v}" for k, v in session_info.items()]
+        return "**ECU / Session Info:**\n\n" + "\n".join(lines), [], "session_info", "fallback"
+
+    # keyword_filter — search across qualifier, field, domain, fragment, feature
+    words = [w for w in q.split() if len(w) >= 2]
+    matched = [
+        p for p in decoded_params
+        if any(
+            w in " ".join([p["qualifier"], p["field"], p.get("domain",""), p.get("fragment",""), p.get("feature","")]).lower()
+            for w in words
+        )
+    ]
+    if matched:
+        lines = [
+            f"**{p['field']}**\n"
+            f"- Qualifier: `{p['qualifier']}`\n"
+            f"- Hex: `{p['hex']}` → Decimal: **{p['decimal']}**"
+            + (f"\n- Domain: {p['domain']}" if p.get("domain") else "")
+            + (f"\n- Fragment: {p['fragment']}" if p.get("fragment") else "")
+            for p in matched
+        ]
+        answer = f"**{len(matched)} parameter(s) matching `{question}`:**\n\n" + "\n\n".join(lines)
+        return answer, [p["qualifier"] for p in matched], "keyword_filter", "fallback"
+
+    return (
+        f"No parameters found matching `{question}`.\n\n"
+        "Try: **'show all'**, a part number, or a subsystem name like **'hvac'**, **'brake'**, **'timer'**.",
+        [], "general", "fallback"
+    )
+
+
+# Keep old answer_question for backward compat — now wraps ai_query with plain context
 def answer_question(
     question: str,
     context_text: str,
     model: str = "qwen2.5:7b",
     host: str | None = None,
 ) -> tuple[str, str]:
-    """Return (answer, source) where source is 'ollama' or 'fallback'."""
-    answer = _try_ollama_qa(question, context_text, model, host)
-    if answer is not None:
-        return answer, "ollama"
-    return _fallback_qa(question, context_text), "fallback"
-
-
-def _try_ollama_qa(question: str, context_text: str, model: str, host: str | None) -> str | None:
+    """Legacy wrapper — used when decoded_params aren't available."""
     if OllamaClient is None:
-        return None
+        return _fallback_ai_query(question, [], {})[0], "fallback"
     try:
         client = OllamaClient(host=host) if host else OllamaClient()
         resp = client.chat(
             model=model,
             messages=[
-                {"role": "system", "content": _QA_SYSTEM.format(context=context_text)},
+                {"role": "system", "content": (
+                    "You are an automotive ECU configuration analyst. "
+                    "Answer using only the data below.\n\n" + context_text
+                )},
                 {"role": "user", "content": question},
             ],
-            options={"temperature": 0.2},
+            options={"temperature": 0.1},
         )
-        return resp["message"]["content"].strip()
+        return resp["message"]["content"].strip(), "ollama"
     except Exception:
-        return None
-
-
-def _fallback_qa(question: str, context_text: str) -> str:
-    """Keyword search over the context text when Ollama isn't available."""
-    q = question.lower()
-    lines = [l for l in context_text.splitlines() if l.strip()]
-
-    # Check for broad queries first
-    if any(w in q for w in ("all", "everything", "full", "list", "summary", "explain", "show", "complete")):
-        param_lines = [l for l in lines if "hex=" in l]
-        if not param_lines:
-            return "No decoded parameters available."
-        bullets = []
-        for l in param_lines:
-            # format: "  Feature (qualifier): VALUE  [hex=...]"
-            stripped = l.strip()
-            colon_idx = stripped.find(":")
-            bracket_idx = stripped.find("[")
-            if colon_idx > 0 and bracket_idx > 0:
-                label = stripped[:colon_idx].strip()
-                value = stripped[colon_idx + 1:bracket_idx].strip()
-                bullets.append(f"- **{label}**: {value}")
-            else:
-                bullets.append(f"- {stripped}")
-        return "**Full decoded configuration:**\n\n" + "\n".join(bullets)
-
-    if any(w in q for w in ("variant", "ecu", "version", "header", "app", "session", "cbf", "sapi")):
-        info_lines = [l for l in lines if "hex=" not in l and l.strip() and not l.startswith("===")]
-        if info_lines:
-            return "**ECU / Session Information:**\n\n" + "\n".join(f"- {l.strip()}" for l in info_lines)
-
-    # Keyword search across parameter lines
-    param_lines = [l for l in lines if "hex=" in l]
-    matches = [l for l in param_lines if any(word in l.lower() for word in q.split() if len(word) > 2)]
-
-    if matches:
-        result_parts = []
-        for l in matches:
-            stripped = l.strip()
-            colon_idx = stripped.find(":")
-            bracket_idx = stripped.find("[")
-            if colon_idx > 0 and bracket_idx > 0:
-                label = stripped[:colon_idx].strip()
-                value = stripped[colon_idx + 1:bracket_idx].strip()
-                meta = stripped[bracket_idx:].strip("[]")
-                result_parts.append(f"**{label}**\n- Value: **{value}**\n- {meta}")
-            else:
-                result_parts.append(stripped)
-        return "\n\n".join(result_parts)
-
-    return (
-        "I couldn't find a specific match. Try:\n"
-        "- **'show all'** — full configuration\n"
-        "- **'What is the drive side?'** — specific feature\n"
-        "- **'What variant is this?'** — ECU / session info"
-    )
+        return _fallback_ai_query(question, [], {})[0], "fallback"

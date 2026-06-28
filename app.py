@@ -25,7 +25,7 @@ from core.decoder import (
     parse_par_text,
 )
 from core.data_loader import find_par_qualifiers_for_part_number, pn_strip_dots
-from core.llm import answer_question
+from core.llm import ai_query, answer_question
 
 
 # -------------------------------------------------------------------------- #
@@ -334,6 +334,43 @@ def _auto_load_reference_par() -> None:
     st.session_state.qualifier_bridge = bridge
 
 
+def _keyword_filter(keyword: str, decoded: list[DecodedParam], bridge: dict) -> str | None:
+    """Search qualifier / feature / domain for a keyword. Returns None if no matches."""
+    kw = keyword.strip().lower()
+    if len(kw) < 2:
+        return None
+
+    matches = [
+        p for p in decoded
+        if kw in p.qualifier.lower()
+        or kw in p.feature_name.lower()
+        or kw in bridge.get(p.qualifier, {}).get("domain", "").lower()
+        or kw in bridge.get(p.qualifier, {}).get("fragment", "").lower()
+        or kw in bridge.get(p.qualifier, {}).get("nomenclature", "").lower()
+    ]
+    if not matches:
+        return None
+
+    lines = [f"**{len(matches)} parameter(s) matching `{keyword}`:**\n"]
+    for p in matches:
+        b = bridge.get(p.qualifier, {})
+        try:
+            dec = str(int(p.hex_value, 16))
+        except ValueError:
+            dec = p.hex_value
+        field = p.qualifier.split(".")[-1]
+        domain   = b.get("domain", "")
+        fragment = b.get("fragment", "")
+        lines.append(
+            f"**{field}**\n"
+            f"- Qualifier: `{p.qualifier}`\n"
+            f"- Hex: `{p.hex_value}` → Decimal: **{dec}** | Type: {p.datatype}"
+            + (f"\n- Domain: {domain}" if domain else "")
+            + (f"\n- Fragment: {fragment}" if fragment else "")
+        )
+    return "\n\n".join(lines)
+
+
 def _answer_part_number(part_num: str, decoded: list[DecodedParam], part_df, param_df, bridge: dict) -> str:
     """Handle a chat message that is a part number lookup."""
     stripped = part_num.strip()
@@ -552,11 +589,27 @@ if decoded is not None:
 
     # ---- Decoded parameters table ----
     st.markdown('<div class="kv-card"><h4>Decoded Parameters — Hex → Decimal</h4>', unsafe_allow_html=True)
+    table_filter = st.text_input(
+        "Filter table",
+        placeholder="Type to filter by qualifier / domain / field name…",
+        label_visibility="collapsed",
+        key="table_filter",
+    )
     if decoded:
         _bridge = st.session_state.qualifier_bridge
+        _tf = table_filter.strip().lower()
         rows = []
         for p in decoded:
             b = _bridge.get(p.qualifier, {})
+            # Apply table filter if set
+            if _tf and not any(
+                _tf in s.lower() for s in [
+                    p.qualifier, p.feature_name,
+                    b.get("domain", ""), b.get("fragment", ""),
+                    p.qualifier.split(".")[-1],
+                ]
+            ):
+                continue
             try:
                 raw_dec = str(int(p.hex_value, 16))
             except ValueError:
@@ -643,20 +696,37 @@ if decoded is not None:
                         reply = _answer_part_number(stripped, decoded, part_df, param_df, bridge)
                         source_badge = '<span class="pill blue">📋 Part Number lookup</span>'
 
-                # Fall back to general Q&A
+                # AI query — Ollama classifies + filters; fallback is deterministic
                 if reply is None:
-                    with st.spinner("Searching configuration…"):
-                        context = build_context_text(session_info, decoded)
-                        reply, source = answer_question(
-                            user_input, context,
+                    # Build compact param dicts for the prompt
+                    _param_dicts = []
+                    for _p in decoded:
+                        _b = bridge.get(_p.qualifier, {})
+                        try:
+                            _dec = str(int(_p.hex_value, 16))
+                        except ValueError:
+                            _dec = _p.hex_value
+                        _param_dicts.append({
+                            "qualifier": _p.qualifier,
+                            "field":     _p.qualifier.split(".")[-1],
+                            "hex":       _p.hex_value,
+                            "decimal":   _dec,
+                            "domain":    _b.get("domain", ""),
+                            "fragment":  _b.get("fragment", ""),
+                            "feature":   _p.feature_name,
+                        })
+
+                    with st.spinner("AI is analysing your query…"):
+                        reply, matched_qs, qtype, ai_src = ai_query(
+                            user_input,
+                            _param_dicts,
+                            session_info,
                             model=settings.ollama_model,
                             host=settings.ollama_host,
                         )
-                    source_badge = (
-                        '<span class="pill ok">🧠 Ollama</span>'
-                        if source == "ollama"
-                        else '<span class="pill warn">⚙️ keyword search</span>'
-                    )
+
+                    src_label = "🧠 Ollama" if ai_src == "ollama" else "⚙️ rule-based"
+                    source_badge = f'<span class="pill {"ok" if ai_src == "ollama" else "warn"}">{src_label} · {qtype}</span>'
 
                 st.markdown(reply)
                 st.markdown(source_badge, unsafe_allow_html=True)
