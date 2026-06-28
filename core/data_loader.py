@@ -42,14 +42,6 @@ class ParHeader:
 
 # ---------- Part Number Dataset ----------
 
-def load_part_numbers(path: Path | None) -> pd.DataFrame:
-    if path and path.exists():
-        df = pd.read_excel(path)
-    else:
-        df = pd.DataFrame(_FALLBACK_PART_ROWS)
-    df.columns = [c.strip() for c in df.columns]
-    return df
-
 
 _PN_COLS       = ["Partnumber", "Part Number", "PartNumber", "Part_Number", "PARTNUMBER", "part_no", "PartNo", "Part number"]
 _NOM_COLS      = ["Nomenclature", "NOMENCLATURE", "Description", "Name", "Feature", "Config"]
@@ -113,12 +105,46 @@ def _cdd_from_xlsx(path: Path) -> dict[str, ParamSpec]:
 
 # ---------- Parameter Values (second Excel) ----------
 
+def _detect_header_row(path: Path, sheet: int = 0, max_scan: int = 15) -> int:
+    """Scan the first rows to find where the real column headers are.
+
+    Returns the 0-based row index of the header row.
+    Looks for cells that contain recognisable column-name keywords.
+    """
+    _HEADER_SIGNALS = {
+        "domain", "fragment", "partnumber", "part number", "part_number",
+        "nomenclature", "parameter value", "parametervalue", "qualifier",
+        "partnr", "partnumbers", "hex", "value", "meaning",
+    }
+    df_raw = pd.read_excel(path, header=None, nrows=max_scan, sheet_name=sheet)
+    for i, row in df_raw.iterrows():
+        row_vals = {str(v).strip().lower().replace(" ", "").replace("_", "") for v in row if pd.notna(v)}
+        # If at least 2 of our signals appear in this row it is likely the header
+        if len(row_vals & {s.replace(" ", "").replace("_", "") for s in _HEADER_SIGNALS}) >= 2:
+            return int(i)
+    return 0   # default: first row
+
+
 def load_param_values(path: Path | None) -> pd.DataFrame | None:
     """Load the second Excel (partnumber_parameter_values). Returns None if not found."""
     if not path or not path.exists():
         return None
-    df = pd.read_excel(path)
+    header_row = _detect_header_row(path)
+    df = pd.read_excel(path, header=header_row)
     df.columns = [str(c).strip() for c in df.columns]
+    # Drop completely empty rows
+    df = df.dropna(how="all").reset_index(drop=True)
+    return df
+
+
+def load_part_numbers(path: Path | None) -> pd.DataFrame:
+    if path and path.exists():
+        header_row = _detect_header_row(path)
+        df = pd.read_excel(path, header=header_row)
+    else:
+        df = pd.DataFrame(_FALLBACK_PART_ROWS)
+    df.columns = [str(c).strip() for c in df.columns]
+    df = df.dropna(how="all").reset_index(drop=True)
     return df
 
 
