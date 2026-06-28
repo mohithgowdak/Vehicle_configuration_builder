@@ -255,7 +255,9 @@ def find_par_qualifiers_for_part_number(
     if not domain_col or not pn_col_param:
         return []
 
-    # Find the domain(s) for this part number in param_values
+    # Normalise both sides to no-dots before comparing:
+    #   Config_Partnumbers: "A.034.447.29.27" → pn_strip_dots → "A0344472927"
+    #   Param_values:       "A0344472927"     → pn_strip_dots → "A0344472927"  (no-op)
     matches = param_df[
         param_df[pn_col_param].astype(str).apply(pn_strip_dots) == pn_nodot
     ]

@@ -146,7 +146,9 @@ def lookup_by_part_number(
     if pn_col is None:
         return None
 
-    mask = part_df[pn_col].astype(str).str.strip().str.upper() == part_num.strip().upper()
+    # Normalise both sides: strip dots so "A.034.447.29.27" == "A0344472927"
+    pn_norm = part_num.strip().replace(".", "").upper()
+    mask = part_df[pn_col].astype(str).str.replace(".", "").str.strip().str.upper() == pn_norm
     rows = part_df[mask]
     if rows.empty:
         return None
