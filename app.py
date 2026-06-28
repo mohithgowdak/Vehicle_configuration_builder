@@ -24,6 +24,7 @@ from core.decoder import (
     lookup_by_part_number,
     parse_par_text,
 )
+from core.data_loader import find_par_qualifiers_for_part_number, pn_strip_dots
 from core.llm import answer_question
 
 
@@ -326,33 +327,75 @@ def _auto_load_reference_par() -> None:
     st.session_state.qualifier_bridge = bridge
 
 
-def _answer_part_number(part_num: str, decoded: list[DecodedParam], part_df) -> str:
+def _answer_part_number(part_num: str, decoded: list[DecodedParam], part_df, param_df, bridge: dict) -> str:
     """Handle a chat message that is a part number lookup."""
-    result = lookup_by_part_number(part_num, part_df, decoded, dl.QUALIFIER_TO_FEATURE)
-    if result is None:
+    stripped = part_num.strip()
+    pn_nodot = pn_strip_dots(stripped)
+
+    # --- Look up in Config_Partnumbers ---
+    pn_col  = dl._find_col(part_df, dl._PN_COLS)
+    nom_col = dl._find_col(part_df, dl._NOM_COLS)
+    ecu_col = dl._find_col(part_df, dl._ECU_COLS)
+
+    nom_text, ecu_text = "", ""
+    if pn_col:
+        mask = part_df[pn_col].astype(str).str.replace(".", "").str.strip() == pn_nodot
+        rows = part_df[mask]
+        if not rows.empty:
+            row = rows.iloc[0]
+            nom_text = str(row[nom_col]).strip() if nom_col else ""
+            ecu_text = str(row[ecu_col]).strip() if ecu_col else ""
+
+    # --- Find matching .par qualifiers via Domain bridge ---
+    matching_qualifiers = find_par_qualifiers_for_part_number(stripped, param_df, bridge)
+
+    # Also try direct feature-name match (fallback)
+    if not matching_qualifiers and nom_text:
+        feature = nom_text.split(":")[0].strip().upper() if ":" in nom_text else nom_text.upper()
+        matching_qualifiers = [q for q, info in bridge.items() if info.get("feature", "").upper() == feature]
+
+    if not matching_qualifiers and not nom_text:
         return (
-            f"Part number `{part_num}` was not found in the loaded Excel database.\n\n"
-            "Check the spelling or ensure the Part Number xlsx is configured in `.env`."
+            f"Part number `{stripped}` was not found in the loaded Excel files.\n\n"
+            "Make sure both `PART_NUMBER_XLSX` and `PARAM_VALUES_XLSX` are set in `.env` "
+            "and the part number is in the dataset."
         )
-    p = result["param"]
+
     lines = [
-        f"**Part Number:** `{result['part_number']}`",
-        f"**Nomenclature:** {result['nomenclature']}",
-        f"**ECU / Variant:** {result['ecu']}",
-        "",
+        f"**Part Number:** `{stripped}`",
     ]
-    if p:
-        lines += [
-            "**Found in .par file:**",
-            f"- Qualifier: `{p.qualifier}`",
-            f"- Hex value: `{p.hex_value}`",
-            f"- Decimal value: **{p.decoded_value}**",
-            f"- Data type: {p.datatype}",
-        ]
+    if nom_text:
+        lines.append(f"**Nomenclature:** {nom_text}")
+    if ecu_text:
+        lines.append(f"**ECU / Variant:** {ecu_text}")
+
+    # Get domain/fragment from bridge for first matching qualifier
+    if matching_qualifiers:
+        first_info = bridge.get(matching_qualifiers[0], {})
+        if first_info.get("domain"):
+            lines.append(f"**Write Command (Domain):** {first_info['domain']}")
+        if first_info.get("fragment"):
+            lines.append(f"**Fragment/Default:** {first_info['fragment']}")
+
+    lines.append("")
+
+    decoded_map = {p.qualifier: p for p in decoded}
+    if matching_qualifiers:
+        lines.append(f"**Parameters in .par file ({len(matching_qualifiers)} found):**")
+        for q in matching_qualifiers:
+            p = decoded_map.get(q)
+            if p:
+                try:
+                    dec = str(int(p.hex_value, 16))
+                except ValueError:
+                    dec = p.hex_value
+                field = q.split(".")[-1]   # e.g. "Timeout_Value"
+                lines.append(f"- `{field}` → Hex: `{p.hex_value}` | Decimal: **{dec}** | Type: {p.datatype}")
+            else:
+                lines.append(f"- `{q.split('.')[-1]}` → not found in .par file")
     else:
-        lines.append(
-            f"_Feature `{result['feature']}` has no matching P-line in the loaded .par file._"
-        )
+        lines.append("_No matching P-lines found in the loaded .par file for this part number._")
+
     return "\n".join(lines)
 
 
@@ -486,20 +529,22 @@ if decoded is not None:
     # ---- Decoded parameters table ----
     st.markdown('<div class="kv-card"><h4>Decoded Parameters — Hex → Decimal</h4>', unsafe_allow_html=True)
     if decoded:
+        _bridge = st.session_state.qualifier_bridge
         rows = []
         for p in decoded:
+            b = _bridge.get(p.qualifier, {})
             try:
                 raw_dec = str(int(p.hex_value, 16))
             except ValueError:
                 raw_dec = p.hex_value
             rows.append({
-                "Feature": p.feature_name,
-                "Qualifier": p.qualifier,
-                "Hex": p.hex_value,
-                "Decimal": raw_dec,
-                "Decoded Value": p.decoded_value,
-                "Type": p.datatype,
-                "Part Number": p.part_number,
+                "Domain (Write Command)": b.get("domain", ""),
+                "Fragment / Default":     b.get("fragment", ""),
+                "Field":                  p.qualifier.split(".")[-1],
+                "Qualifier":              p.qualifier,
+                "Hex":                    p.hex_value,
+                "Decimal":                raw_dec,
+                "Type":                   p.datatype,
             })
         df = pd.DataFrame(rows)
         st.dataframe(df, use_container_width=True, hide_index=True)
@@ -554,19 +599,24 @@ if decoded is not None:
 
         with st.chat_message("assistant", avatar="🤖"):
             try:
-                part_df = st.session_state.part_df
                 stripped = user_input.strip()
                 reply = None
                 source_badge = ""
 
                 # Always try part number lookup first — no regex gate
+                part_df   = st.session_state.part_df
+                param_df  = st.session_state.param_df
+                bridge    = st.session_state.qualifier_bridge
+
                 if part_df is not None:
                     with st.spinner("Looking up in part number database…"):
                         pn_result = lookup_by_part_number(
                             stripped, part_df, decoded, dl.QUALIFIER_TO_FEATURE
                         )
-                    if pn_result is not None:
-                        reply = _answer_part_number(stripped, decoded, part_df)
+                        # Also check if it maps via domain bridge
+                        domain_qs = find_par_qualifiers_for_part_number(stripped, param_df, bridge)
+                    if pn_result is not None or domain_qs:
+                        reply = _answer_part_number(stripped, decoded, part_df, param_df, bridge)
                         source_badge = '<span class="pill blue">📋 Part Number lookup</span>'
 
                 # Fall back to general Q&A

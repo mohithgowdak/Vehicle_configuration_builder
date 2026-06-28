@@ -17,6 +17,7 @@ codebook so the UI demo still works end-to-end.
 from __future__ import annotations
 
 import json
+import re as _re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -50,10 +51,13 @@ def load_part_numbers(path: Path | None) -> pd.DataFrame:
     return df
 
 
-_PN_COLS  = ["Partnumber", "Part Number", "PartNumber", "Part_Number", "PARTNUMBER", "part_no", "PartNo"]
-_NOM_COLS = ["Nomenclature", "NOMENCLATURE", "Description", "Name", "Feature", "Config"]
-_ECU_COLS = ["ECU Qualifier", "ECU_Qualifier", "Variant", "ECU", "Qualifier", "ECUQualifier"]
-_TYP_COLS = ["Type", "TYPE", "Category", "Kind"]
+_PN_COLS       = ["Partnumber", "Part Number", "PartNumber", "Part_Number", "PARTNUMBER", "part_no", "PartNo", "Part number"]
+_NOM_COLS      = ["Nomenclature", "NOMENCLATURE", "Description", "Name", "Feature", "Config"]
+_ECU_COLS      = ["ECU Qualifier", "ECU_Qualifier", "Variant", "ECU", "Qualifier", "ECUQualifier"]
+_TYP_COLS      = ["Type", "TYPE", "Category", "Kind"]
+_DOMAIN_COLS   = ["Domain", "DOMAIN", "ParameterGroup", "Parameter Group", "Write Command", "Group"]
+_FRAGMENT_COLS = ["Fragment/Default", "Fragment", "Default", "FragmentDefault", "Preset", "Meaning", "Description"]
+_PVAL_COLS     = ["Parameter Value", "ParameterValue", "Value", "HexValue", "Hex", "ParamValue"]
 
 
 def variants(df: pd.DataFrame) -> list[str]:
@@ -118,104 +122,100 @@ def load_param_values(path: Path | None) -> pd.DataFrame | None:
     return df
 
 
+def domain_to_qualifier_prefix(domain: str) -> str:
+    """'CGW_BKAM Timer Write' → 'VCD_CGW_BKAM_Timer'"""
+    cleaned = _re.sub(r"\s*Write\s*$", "", domain, flags=_re.IGNORECASE).strip()
+    cleaned = cleaned.replace(" ", "_")
+    return cleaned if cleaned.startswith("VCD_") else "VCD_" + cleaned
+
+
+def pn_strip_dots(pn: str) -> str:
+    """'A.034.447.29.27' → 'A0344472927'"""
+    return str(pn).replace(".", "").strip()
+
+
 def build_qualifier_bridge(
     par_qualifiers: list[str],
     part_df: pd.DataFrame,
     param_df: pd.DataFrame | None,
 ) -> dict[str, dict]:
     """
-    Try to map each .par qualifier to a row in the Excel files.
+    Map each .par qualifier to Excel rows using the Domain → VCD prefix pattern.
 
-    Returns dict[qualifier] = {
-        "feature": str,       # human-readable name
-        "part_number": str,
-        "nomenclature": str,
-        "source": str,        # which strategy found it
-        "row": dict,          # raw row for display
-    }
+    partnumber_parameter_values Domain:  'CGW_BKAM Timer Write'
+    Transforms to qualifier prefix:      'VCD_CGW_BKAM_Timer'
+    Matches .par qualifier group:        'VCD_CGW_BKAM_Timer.Timeout_Value' → group 'VCD_CGW_BKAM_Timer'
+
+    Part number bridge:
+    Config_Partnumbers:   'A.034.447.29.27'  (dots)
+    Param_values:         'A0344472927'       (no dots)  ← same number, just remove dots
     """
     bridge: dict[str, dict] = {}
 
-    # ---- Strategy 1: param_df has a column whose values match par qualifiers ----
-    if param_df is not None:
-        for col in param_df.columns:
-            col_vals = param_df[col].astype(str).str.strip()
-            for q in par_qualifiers:
-                if q in bridge:
-                    continue
-                matches = param_df[col_vals == q]
-                if not matches.empty:
-                    row = matches.iloc[0]
-                    nom_col = _find_col(param_df, _NOM_COLS)
-                    pn_col  = _find_col(param_df, _PN_COLS)
-                    bridge[q] = {
-                        "feature":      str(row[nom_col]).strip() if nom_col else "",
-                        "part_number":  str(row[pn_col]).strip()  if pn_col  else "",
-                        "nomenclature": str(row[nom_col]).strip() if nom_col else "",
-                        "source":       f"param_values[{col}]",
-                        "row":          row.to_dict(),
-                    }
+    domain_col    = _find_col(param_df, _DOMAIN_COLS)    if param_df is not None else None
+    fragment_col  = _find_col(param_df, _FRAGMENT_COLS)  if param_df is not None else None
+    pval_col      = _find_col(param_df, _PVAL_COLS)      if param_df is not None else None
+    pn_col_param  = _find_col(param_df, _PN_COLS)        if param_df is not None else None
+    pn_col_part   = _find_col(part_df,  _PN_COLS)
+    nom_col_part  = _find_col(part_df,  _NOM_COLS)
 
-    # ---- Strategy 2: match tail of qualifier against any column value in param_df ----
-    if param_df is not None:
+    # ---- Strategy 1 (primary): Domain prefix → qualifier group match ----
+    if param_df is not None and domain_col:
+        # Pre-build: qualifier_group → list of param_df rows
+        prefix_to_rows: dict[str, list] = {}
+        for _, row in param_df.iterrows():
+            dom = str(row[domain_col]).strip()
+            if not dom or dom.lower() == "nan":
+                continue
+            prefix = domain_to_qualifier_prefix(dom)
+            prefix_to_rows.setdefault(prefix, []).append(row)
+
+        # Pre-build: no-dots part number → Config_Partnumbers nomenclature
+        pn_to_nom: dict[str, str] = {}
+        if pn_col_part and nom_col_part:
+            for _, pr in part_df.iterrows():
+                pn = pn_strip_dots(str(pr[pn_col_part]))
+                nom = str(pr[nom_col_part]).strip()
+                if pn and nom and nom.lower() != "nan":
+                    pn_to_nom[pn] = nom
+
         for q in par_qualifiers:
             if q in bridge:
                 continue
-            tail = q.split(".")[-1]   # e.g. "Timeout_Value"
-            for col in param_df.columns:
-                col_vals = param_df[col].astype(str).str.strip()
-                matches = param_df[col_vals.str.lower() == tail.lower()]
-                if not matches.empty:
-                    row = matches.iloc[0]
-                    nom_col = _find_col(param_df, _NOM_COLS)
-                    pn_col  = _find_col(param_df, _PN_COLS)
-                    bridge[q] = {
-                        "feature":      str(row[nom_col]).strip() if nom_col else tail,
-                        "part_number":  str(row[pn_col]).strip()  if pn_col  else "",
-                        "nomenclature": str(row[nom_col]).strip() if nom_col else "",
-                        "source":       f"tail-match[{col}]",
-                        "row":          row.to_dict(),
-                    }
-                    break
+            q_group = q.split(".")[0]          # e.g. "VCD_CGW_BKAM_Timer"
+            rows = prefix_to_rows.get(q_group)
+            if not rows:
+                continue
+            row = rows[0]
+            dom      = str(row[domain_col]).strip()
+            fragment = str(row[fragment_col]).strip() if fragment_col else ""
+            pval     = str(row[pval_col]).strip()     if pval_col    else ""
+            pn_raw   = str(row[pn_col_param]).strip() if pn_col_param else ""
+            pn_nodot = pn_strip_dots(pn_raw)
 
-    # ---- Strategy 3: link via part_number shared between both Excels ----
-    if param_df is not None:
-        pn_col_part   = _find_col(part_df, _PN_COLS)
-        pn_col_param  = _find_col(param_df, _PN_COLS)
-        q_col_param   = _find_col(param_df, ["Qualifier", "ECU Qualifier", "CDD Qualifier",
-                                              "Parameter", "QualifierName", "Param"])
-        if pn_col_part and pn_col_param and q_col_param:
-            for q in par_qualifiers:
-                if q in bridge:
-                    continue
-                # Find rows in param_df whose qualifier column matches q
-                matches_param = param_df[
-                    param_df[q_col_param].astype(str).str.strip() == q
-                ]
-                if matches_param.empty:
-                    continue
-                pn = str(matches_param.iloc[0][pn_col_param]).strip()
-                # Find that part number in part_df
-                matches_part = part_df[
-                    part_df[pn_col_part].astype(str).str.strip() == pn
-                ]
-                nom_col = _find_col(part_df, _NOM_COLS)
-                feature = ""
-                if not matches_part.empty and nom_col:
-                    feature = str(matches_part.iloc[0][nom_col]).strip()
-                bridge[q] = {
-                    "feature":      feature,
-                    "part_number":  pn,
-                    "nomenclature": feature,
-                    "source":       "part_number-bridge",
-                    "row":          matches_param.iloc[0].to_dict(),
-                }
+            # Look up human-readable name from Config_Partnumbers
+            nom_from_part = pn_to_nom.get(pn_nodot, "")
+            feature = nom_from_part or fragment or dom
 
-    # ---- Strategy 4: hardcoded fallback ----
+            bridge[q] = {
+                "feature":      feature,
+                "domain":       dom,
+                "fragment":     fragment,
+                "param_value":  pval,
+                "part_number":  pn_nodot,
+                "nomenclature": nom_from_part,
+                "source":       "domain-prefix",
+                "row":          row.to_dict(),
+            }
+
+    # ---- Strategy 2 (fallback): hardcoded built-in map ----
     for q in par_qualifiers:
         if q not in bridge and q in QUALIFIER_TO_FEATURE:
             bridge[q] = {
                 "feature":      QUALIFIER_TO_FEATURE[q],
+                "domain":       "",
+                "fragment":     "",
+                "param_value":  "",
                 "part_number":  "",
                 "nomenclature": QUALIFIER_TO_FEATURE[q],
                 "source":       "built-in map",
@@ -223,6 +223,41 @@ def build_qualifier_bridge(
             }
 
     return bridge
+
+
+def find_par_qualifiers_for_part_number(
+    part_number: str,
+    param_df: pd.DataFrame | None,
+    bridge: dict[str, dict],
+) -> list[str]:
+    """
+    Given a part number (dotted or not), return all .par qualifiers that belong
+    to the same Domain row in param_values.
+    """
+    if param_df is None:
+        return []
+
+    pn_nodot = pn_strip_dots(part_number)
+    domain_col   = _find_col(param_df, _DOMAIN_COLS)
+    pn_col_param = _find_col(param_df, _PN_COLS)
+    if not domain_col or not pn_col_param:
+        return []
+
+    # Find the domain(s) for this part number in param_values
+    matches = param_df[
+        param_df[pn_col_param].astype(str).apply(pn_strip_dots) == pn_nodot
+    ]
+    if matches.empty:
+        return []
+
+    target_domains = set(str(r).strip() for r in matches[domain_col])
+    target_prefixes = {domain_to_qualifier_prefix(d) for d in target_domains}
+
+    # Return all bridge qualifiers whose group matches these prefixes
+    return [
+        q for q in bridge
+        if q.split(".")[0] in target_prefixes
+    ]
 
 
 # ---------- Reference .par ----------
