@@ -25,7 +25,11 @@ from core.decoder import (
     parse_par_text,
 )
 from core.data_loader import find_par_qualifiers_for_part_number, pn_strip_dots
-from core.llm import ai_query, answer_question
+try:
+    from core.llm import ai_query, answer_question
+except ImportError:
+    from core.llm import answer_question          # older version of llm.py
+    ai_query = None  # type: ignore
 
 
 # -------------------------------------------------------------------------- #
@@ -336,18 +340,27 @@ def _auto_load_reference_par() -> None:
 
 def _keyword_filter(keyword: str, decoded: list[DecodedParam], bridge: dict) -> str | None:
     """Search qualifier / feature / domain for a keyword. Returns None if no matches."""
+    import re as _re
     kw = keyword.strip().lower()
     if len(kw) < 2:
         return None
 
-    matches = [
-        p for p in decoded
-        if kw in p.qualifier.lower()
-        or kw in p.feature_name.lower()
-        or kw in bridge.get(p.qualifier, {}).get("domain", "").lower()
-        or kw in bridge.get(p.qualifier, {}).get("fragment", "").lower()
-        or kw in bridge.get(p.qualifier, {}).get("nomenclature", "").lower()
-    ]
+    # Split on spaces and underscores so "clcs_installed" → ["clcs", "installed"]
+    tokens = [t for t in _re.split(r"[\s_]+", kw) if len(t) >= 3]
+    search_terms = list({kw} | set(tokens))
+
+    def _hit(p: DecodedParam) -> bool:
+        haystack = " ".join([
+            p.qualifier.lower(),
+            p.feature_name.lower(),
+            bridge.get(p.qualifier, {}).get("domain",       "").lower(),
+            bridge.get(p.qualifier, {}).get("fragment",     "").lower(),
+            bridge.get(p.qualifier, {}).get("nomenclature", "").lower(),
+        ])
+        # ALL tokens must appear — "clcs_installed" → both "clcs" AND "installed" required
+        return all(t in haystack for t in search_terms)
+
+    matches = [p for p in decoded if _hit(p)]
     if not matches:
         return None
 
@@ -717,13 +730,27 @@ if decoded is not None:
                         })
 
                     with st.spinner("AI is analysing your query…"):
-                        reply, matched_qs, qtype, ai_src = ai_query(
-                            user_input,
-                            _param_dicts,
-                            session_info,
-                            model=settings.ollama_model,
-                            host=settings.ollama_host,
-                        )
+                        if ai_query is not None:
+                            reply, matched_qs, qtype, ai_src = ai_query(
+                                user_input,
+                                _param_dicts,
+                                session_info,
+                                model=settings.ollama_model,
+                                host=settings.ollama_host,
+                            )
+                        else:
+                            # ai_query not available — use keyword filter then general Q&A
+                            kw_reply = _keyword_filter(stripped, decoded, bridge)
+                            if kw_reply:
+                                reply, ai_src, qtype = kw_reply, "fallback", "keyword_filter"
+                            else:
+                                context = build_context_text(session_info, decoded)
+                                reply, ai_src = answer_question(
+                                    user_input, context,
+                                    model=settings.ollama_model,
+                                    host=settings.ollama_host,
+                                )
+                                qtype = "general"
 
                     src_label = "🧠 Ollama" if ai_src == "ollama" else "⚙️ rule-based"
                     source_badge = f'<span class="pill {"ok" if ai_src == "ollama" else "warn"}">{src_label} · {qtype}</span>'

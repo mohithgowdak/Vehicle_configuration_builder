@@ -267,41 +267,58 @@ def _try_ollama_ai_query(
         return None
 
 
+_SHOW_ALL_WORDS    = {"all", "everything", "full", "list", "summary", "show", "complete"}
+_SESSION_INFO_WORDS = {"variant", "ecu", "version", "header", "app", "session", "cbf"}
+
+
 def _fallback_ai_query(
     question: str,
     decoded_params: list[dict],
     session_info: dict,
 ) -> tuple[str, list[str], str, str]:
     """Rule-based fallback when Ollama is not available."""
-    q = question.lower()
-    valid_qs = {p["qualifier"] for p in decoded_params}
+    q = question.lower().strip()
+    # Use WHOLE-WORD sets — never substring — so "installed" doesn't trigger "all"
+    q_words = set(q.split())
 
-    # show_all
-    if any(w in q for w in ("all", "everything", "full", "list", "summary", "show", "complete")):
+    # show_all — only if the user literally typed one of these words
+    if q_words & _SHOW_ALL_WORDS:
         lines = [f"- **{p['field']}** (`{p['qualifier']}`): hex `{p['hex']}` → **{p['decimal']}**"
                  for p in decoded_params]
         return "**All parameters:**\n\n" + "\n".join(lines), [], "show_all", "fallback"
 
     # session_info
-    if any(w in q for w in ("variant", "ecu", "version", "header", "app", "session", "cbf")):
+    if q_words & _SESSION_INFO_WORDS:
         lines = [f"- **{k}**: {v}" for k, v in session_info.items()]
         return "**ECU / Session Info:**\n\n" + "\n".join(lines), [], "session_info", "fallback"
 
-    # keyword_filter — search across qualifier, field, domain, fragment, feature
-    words = [w for w in q.split() if len(w) >= 2]
+    # keyword_filter — search qualifier + field + domain + fragment for each word in the query
+    # Use the raw query tokens (handles underscore-joined identifiers like "clcs_installed")
+    # Split on spaces AND underscores so "clcs_installed" becomes ["clcs", "installed"]
+    tokens = [t for t in re.split(r"[\s_]+", q) if len(t) >= 3]
+    # Also keep the original unsplit query in case it matches verbatim
+    search_terms = list({q} | set(tokens))
+
     matched = [
         p for p in decoded_params
-        if any(
-            w in " ".join([p["qualifier"], p["field"], p.get("domain",""), p.get("fragment",""), p.get("feature","")]).lower()
-            for w in words
+        if all(
+            term in " ".join([
+                p["qualifier"].lower(),
+                p["field"].lower(),
+                p.get("domain",   "").lower(),
+                p.get("fragment", "").lower(),
+                p.get("feature",  "").lower(),
+            ])
+            for term in search_terms
         )
     ]
+
     if matched:
         lines = [
             f"**{p['field']}**\n"
             f"- Qualifier: `{p['qualifier']}`\n"
             f"- Hex: `{p['hex']}` → Decimal: **{p['decimal']}**"
-            + (f"\n- Domain: {p['domain']}" if p.get("domain") else "")
+            + (f"\n- Domain: {p['domain']}"   if p.get("domain")   else "")
             + (f"\n- Fragment: {p['fragment']}" if p.get("fragment") else "")
             for p in matched
         ]
