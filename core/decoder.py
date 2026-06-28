@@ -137,11 +137,11 @@ def lookup_by_part_number(
     qualifier_to_feature: dict[str, str],
 ) -> dict | None:
     """Return a result dict for a given part number, or None if not found."""
-    from core.data_loader import _find_col  # local import avoids circular at module level
+    from core.data_loader import _find_col, _PN_COLS, _NOM_COLS, _ECU_COLS
 
-    pn_col = _find_col(part_df, ["Partnumber", "Part Number", "PartNumber", "PARTNUMBER"])
-    nom_col = _find_col(part_df, ["Nomenclature", "NOMENCLATURE"])
-    ecu_col = _find_col(part_df, ["ECU Qualifier", "ECU_Qualifier", "Variant"])
+    pn_col  = _find_col(part_df, _PN_COLS)
+    nom_col = _find_col(part_df, _NOM_COLS)
+    ecu_col = _find_col(part_df, _ECU_COLS)
 
     if pn_col is None:
         return None

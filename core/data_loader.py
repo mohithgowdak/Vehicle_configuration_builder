@@ -50,16 +50,22 @@ def load_part_numbers(path: Path | None) -> pd.DataFrame:
     return df
 
 
+_PN_COLS  = ["Partnumber", "Part Number", "PartNumber", "Part_Number", "PARTNUMBER", "part_no", "PartNo"]
+_NOM_COLS = ["Nomenclature", "NOMENCLATURE", "Description", "Name", "Feature", "Config"]
+_ECU_COLS = ["ECU Qualifier", "ECU_Qualifier", "Variant", "ECU", "Qualifier", "ECUQualifier"]
+_TYP_COLS = ["Type", "TYPE", "Category", "Kind"]
+
+
 def variants(df: pd.DataFrame) -> list[str]:
-    col = _find_col(df, ["ECU Qualifier", "ECU_Qualifier", "Variant"])
+    col = _find_col(df, _ECU_COLS)
     if not col:
         return []
     return sorted({str(v).strip() for v in df[col].dropna() if str(v).strip()})
 
 
 def parameters_for_variant(df: pd.DataFrame, variant: str) -> pd.DataFrame:
-    ecu_col = _find_col(df, ["ECU Qualifier", "ECU_Qualifier", "Variant"])
-    type_col = _find_col(df, ["Type"])
+    ecu_col = _find_col(df, _ECU_COLS)
+    type_col = _find_col(df, _TYP_COLS)
     if not ecu_col:
         return df.head(0)
     sub = df[df[ecu_col].astype(str).str.strip() == variant]
@@ -145,10 +151,15 @@ def load_reference_par(path: Path | None) -> ParHeader:
 # ---------- helpers ----------
 
 def _find_col(df: pd.DataFrame, candidates: list[str]) -> str | None:
-    lookup = {c.lower(): c for c in df.columns}
+    """Case-insensitive, space/underscore-normalised column lookup."""
+    def _norm(s: str) -> str:
+        return s.lower().replace(" ", "").replace("_", "").replace("-", "")
+
+    lookup = {_norm(c): c for c in df.columns}
     for cand in candidates:
-        if cand.lower() in lookup:
-            return lookup[cand.lower()]
+        hit = lookup.get(_norm(cand))
+        if hit:
+            return hit
     return None
 
 

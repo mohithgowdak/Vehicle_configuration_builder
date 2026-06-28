@@ -16,8 +16,6 @@ import streamlit as st
 
 from core import data_loader as dl
 from core.config import Settings
-import re
-
 from core.decoder import (
     DecodedParam,
     build_context_text,
@@ -28,7 +26,6 @@ from core.decoder import (
 )
 from core.llm import answer_question
 
-_PART_NUM_RE = re.compile(r"^[A-Za-z]\.\d{3}\.\d{3}\.\d{2}\.\d{2}$")
 
 # -------------------------------------------------------------------------- #
 # Page config
@@ -355,11 +352,19 @@ with st.sidebar:
     for label, (ok, path) in settings.status().items():
         css = "ok" if ok else "warn"
         icon = "✓" if ok else "○"
-        note = "" if ok else " (using built-in demo data)"
+        note = "" if ok else " (demo data)"
         st.markdown(
             f'<div class="pill {css}">{icon} {label}{note}</div>',
             unsafe_allow_html=True,
         )
+
+    # Show column names detected from the real Excel so user can verify
+    part_df_check = st.session_state.get("part_df")
+    if part_df_check is not None and len(part_df_check.columns) > 0:
+        with st.expander("📊 Excel columns detected", expanded=False):
+            st.caption("Columns found in Part Number xlsx:")
+            st.code(", ".join(part_df_check.columns.tolist()))
+            st.caption(f"{len(part_df_check)} rows loaded")
 
     st.divider()
     st.markdown("### Try it")
@@ -464,12 +469,27 @@ if decoded is not None:
         with st.chat_message(msg["role"], avatar=avatar):
             st.markdown(msg["content"])
 
-    user_input = st.chat_input(
-        "Enter a part number (e.g. A.034.447.29.27) or ask a question…"
-    )
-    if not user_input and st.session_state.pending_prompt:
+    # Resolve pending prompt from sidebar buttons
+    user_input = None
+    if st.session_state.pending_prompt:
         user_input = st.session_state.pending_prompt
         st.session_state.pending_prompt = None
+
+    # Input form — reliable Enter-key submission across all Streamlit versions
+    with st.form("chat_form", clear_on_submit=True):
+        col_inp, col_btn = st.columns([5, 1])
+        with col_inp:
+            typed = st.text_input(
+                "query",
+                placeholder="Enter a part number (e.g. A.034.447.29.27) or ask a question…",
+                label_visibility="collapsed",
+                key="chat_text_input",
+            )
+        with col_btn:
+            send = st.form_submit_button("Send →", use_container_width=True)
+
+    if send and typed:
+        user_input = typed
 
     if user_input:
         st.session_state.messages.append({"role": "user", "content": user_input})
@@ -477,36 +497,44 @@ if decoded is not None:
             st.markdown(user_input)
 
         with st.chat_message("assistant", avatar="🤖"):
-            part_df = st.session_state.part_df
+            try:
+                part_df = st.session_state.part_df
+                stripped = user_input.strip()
+                reply = None
+                source_badge = ""
 
-            # --- Part number path ---
-            stripped = user_input.strip()
-            if _PART_NUM_RE.match(stripped) or (
-                part_df is not None and stripped.upper() in
-                part_df.iloc[:, 0].astype(str).str.strip().str.upper().values
-            ):
-                with st.spinner("Looking up part number…"):
-                    reply = _answer_part_number(stripped, decoded, part_df)
-                source_badge = '<span class="pill blue">📋 Part Number lookup</span>'
+                # Always try part number lookup first — no regex gate
+                if part_df is not None:
+                    with st.spinner("Looking up in part number database…"):
+                        pn_result = lookup_by_part_number(
+                            stripped, part_df, decoded, dl.QUALIFIER_TO_FEATURE
+                        )
+                    if pn_result is not None:
+                        reply = _answer_part_number(stripped, decoded, part_df)
+                        source_badge = '<span class="pill blue">📋 Part Number lookup</span>'
 
-            # --- General Q&A path ---
-            else:
-                with st.spinner("Searching configuration…"):
-                    context = build_context_text(session_info, decoded)
-                    reply, source = answer_question(
-                        user_input, context,
-                        model=settings.ollama_model,
-                        host=settings.ollama_host,
+                # Fall back to general Q&A
+                if reply is None:
+                    with st.spinner("Searching configuration…"):
+                        context = build_context_text(session_info, decoded)
+                        reply, source = answer_question(
+                            user_input, context,
+                            model=settings.ollama_model,
+                            host=settings.ollama_host,
+                        )
+                    source_badge = (
+                        '<span class="pill ok">🧠 Ollama</span>'
+                        if source == "ollama"
+                        else '<span class="pill warn">⚙️ keyword search</span>'
                     )
-                source_badge = (
-                    '<span class="pill ok">🧠 Ollama</span>'
-                    if source == "ollama"
-                    else '<span class="pill warn">⚙️ keyword search</span>'
-                )
 
-            st.markdown(reply)
-            st.markdown(source_badge, unsafe_allow_html=True)
-            full_reply = f"{reply}\n\n{source_badge}"
+                st.markdown(reply)
+                st.markdown(source_badge, unsafe_allow_html=True)
+                full_reply = reply
+
+            except Exception as exc:
+                st.error(f"Error processing input: {exc}")
+                full_reply = f"❌ Error: {exc}"
 
         st.session_state.messages.append({"role": "assistant", "content": full_reply})
 
