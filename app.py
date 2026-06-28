@@ -209,6 +209,11 @@ div[data-testid="stSidebar"] h2 {{ font-size: 1.05rem; }}
 # -------------------------------------------------------------------------- #
 
 st.session_state.settings = Settings.load()
+# Clear resource cache whenever settings change so bridge rebuilds with fresh data
+if "last_settings_hash" not in st.session_state or st.session_state.last_settings_hash != str(st.session_state.settings):
+    st.cache_resource.clear()
+    st.session_state.last_settings_hash = str(st.session_state.settings)
+    st.session_state.decoded_params = None   # force reload
 _s: Settings = st.session_state.settings
 _bg_uri, _bg_kind = _load_background(_s.background_image)
 st.markdown(build_css(_bg_uri, _bg_kind, _s.background_overlay), unsafe_allow_html=True)

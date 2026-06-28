@@ -129,6 +129,17 @@ def domain_to_qualifier_prefix(domain: str) -> str:
     return cleaned if cleaned.startswith("VCD_") else "VCD_" + cleaned
 
 
+def _norm_key(s: str) -> str:
+    """Normalize for fuzzy matching: strip VCD_/CGW_/VCD_CGW_ prefixes, Write suffix, lowercase."""
+    s = _re.sub(r"\s*Write\s*$", "", str(s).strip(), flags=_re.IGNORECASE)
+    s = s.upper()
+    for pfx in ("VCD_CGW_", "VCD_", "CGW_"):
+        if s.startswith(pfx):
+            s = s[len(pfx):]
+            break
+    return s.lower().replace("_", "").replace(" ", "").replace("-", "")
+
+
 def pn_strip_dots(pn: str) -> str:
     """'A.034.447.29.27' → 'A0344472927'"""
     return str(pn).replace(".", "").strip()
@@ -159,16 +170,17 @@ def build_qualifier_bridge(
     pn_col_part   = _find_col(part_df,  _PN_COLS)
     nom_col_part  = _find_col(part_df,  _NOM_COLS)
 
-    # ---- Strategy 1 (primary): Domain prefix → qualifier group match ----
+    # ---- Strategy 1 (primary): normalized Domain ↔ qualifier group fuzzy match ----
+    # Strips VCD_/CGW_/VCD_CGW_ prefixes from both sides before comparing so that
+    # "CGW_Third Party PT Config Write" matches "VCD_Third_Party_PT_Config"
     if param_df is not None and domain_col:
-        # Pre-build: qualifier_group → list of param_df rows
-        prefix_to_rows: dict[str, list] = {}
+        # Pre-build: normalized_key → list of param_df rows
+        norm_to_rows: dict[str, list] = {}
         for _, row in param_df.iterrows():
             dom = str(row[domain_col]).strip()
             if not dom or dom.lower() == "nan":
                 continue
-            prefix = domain_to_qualifier_prefix(dom)
-            prefix_to_rows.setdefault(prefix, []).append(row)
+            norm_to_rows.setdefault(_norm_key(dom), []).append(row)
 
         # Pre-build: no-dots part number → Config_Partnumbers nomenclature
         pn_to_nom: dict[str, str] = {}
@@ -182,8 +194,9 @@ def build_qualifier_bridge(
         for q in par_qualifiers:
             if q in bridge:
                 continue
-            q_group = q.split(".")[0]          # e.g. "VCD_CGW_BKAM_Timer"
-            rows = prefix_to_rows.get(q_group)
+            q_group = q.split(".")[0]          # e.g. "VCD_Third_Party_PT_Config"
+            q_norm  = _norm_key(q_group)       # e.g. "thirdpartyptconfig"
+            rows = norm_to_rows.get(q_norm)
             if not rows:
                 continue
             row = rows[0]
@@ -193,7 +206,6 @@ def build_qualifier_bridge(
             pn_raw   = str(row[pn_col_param]).strip() if pn_col_param else ""
             pn_nodot = pn_strip_dots(pn_raw)
 
-            # Look up human-readable name from Config_Partnumbers
             nom_from_part = pn_to_nom.get(pn_nodot, "")
             feature = nom_from_part or fragment or dom
 
@@ -204,7 +216,7 @@ def build_qualifier_bridge(
                 "param_value":  pval,
                 "part_number":  pn_nodot,
                 "nomenclature": nom_from_part,
-                "source":       "domain-prefix",
+                "source":       "domain-fuzzy",
                 "row":          row.to_dict(),
             }
 
@@ -250,13 +262,12 @@ def find_par_qualifiers_for_part_number(
     if matches.empty:
         return []
 
-    target_domains = set(str(r).strip() for r in matches[domain_col])
-    target_prefixes = {domain_to_qualifier_prefix(d) for d in target_domains}
+    target_norms = {_norm_key(str(d)) for d in matches[domain_col]}
 
-    # Return all bridge qualifiers whose group matches these prefixes
+    # Return all bridge qualifiers whose normalized group matches
     return [
         q for q in bridge
-        if q.split(".")[0] in target_prefixes
+        if _norm_key(q.split(".")[0]) in target_norms
     ]
 
 
