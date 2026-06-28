@@ -739,7 +739,6 @@ if decoded is not None:
                                 host=settings.ollama_host,
                             )
                         else:
-                            # ai_query not available — use keyword filter then general Q&A
                             kw_reply = _keyword_filter(stripped, decoded, bridge)
                             if kw_reply:
                                 reply, ai_src, qtype = kw_reply, "fallback", "keyword_filter"
@@ -752,11 +751,53 @@ if decoded is not None:
                                 )
                                 qtype = "general"
 
+                    # For show_all / session_info, generate response from real data
+                    # regardless of what the LLM said — avoids hallucination
+                    if qtype == "show_all":
+                        rows_text = "\n".join(
+                            f"- **{p['field']}** — hex `{p['hex']}` → decimal **{p['decimal']}**  "
+                            f"`{p['qualifier']}`"
+                            for p in _param_dicts
+                        )
+                        reply = f"**All {len(_param_dicts)} parameters:**\n\n{rows_text}"
+
+                    elif qtype == "session_info":
+                        si_lines = "\n".join(f"- **{k}**: {v}" for k, v in session_info.items())
+                        reply = f"**ECU / Session Info:**\n\n{si_lines}"
+
                     src_label = "🧠 Ollama" if ai_src == "ollama" else "⚙️ rule-based"
                     source_badge = f'<span class="pill {"ok" if ai_src == "ollama" else "warn"}">{src_label} · {qtype}</span>'
 
                 st.markdown(reply)
                 st.markdown(source_badge, unsafe_allow_html=True)
+
+                # ---- Save output to .txt ----
+                from datetime import datetime as _dt
+                _ts   = _dt.now().strftime("%Y%m%d_%H%M%S")
+                _safe = "".join(c if c.isalnum() or c in "-_" else "_" for c in stripped[:40])
+                _txt_name = f"query_{_safe}_{_ts}.txt"
+                _txt_body = (
+                    f"Query   : {user_input}\n"
+                    f"Time    : {_dt.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+                    f"PAR file: {st.session_state.par_filename or 'unknown'}\n"
+                    f"{'='*60}\n\n"
+                    + reply.replace("**", "").replace("`", "")  # strip markdown
+                )
+                # Auto-save to OUTPUT_DIR
+                try:
+                    _out_path = settings.output_dir / _txt_name
+                    _out_path.write_text(_txt_body, encoding="utf-8")
+                except Exception:
+                    pass   # output_dir not writable — silently skip
+
+                # Download button
+                st.download_button(
+                    label="⬇️ Download result as .txt",
+                    data=_txt_body,
+                    file_name=_txt_name,
+                    mime="text/plain",
+                    use_container_width=False,
+                )
                 full_reply = reply
 
             except Exception as exc:

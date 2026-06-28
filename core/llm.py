@@ -201,24 +201,74 @@ _AI_RESPONSE_SCHEMA = {
 }
 
 
+def _is_keyword_search(text: str) -> bool:
+    """True when the input is a plain keyword/identifier, not a natural-language question."""
+    text = text.strip()
+    if "?" in text:
+        return False
+    words = text.lower().split()
+    question_words = {"what", "how", "why", "which", "when", "where",
+                      "is", "are", "can", "does", "do", "tell", "give",
+                      "show", "list", "explain", "describe", "find"}
+    # If it contains question words or is longer than 4 words, treat as NL question
+    if set(words) & question_words:
+        return False
+    return len(words) <= 4
+
+
 def ai_query(
     question: str,
-    decoded_params: list[dict],   # list of dicts with qualifier/field/hex/decimal/domain/fragment/feature
+    decoded_params: list[dict],
     session_info: dict,
     model: str = "qwen2.5:7b",
     host: str | None = None,
 ) -> tuple[str, list[str], str, str]:
     """
-    Send query + full decoded data to Ollama.
+    Route the query:
+    - Keywords / identifiers → Python filter (fast, precise, no hallucination)
+    - Natural language questions → Ollama
     Returns (answer, matched_qualifiers, query_type, source).
-    Falls back to deterministic logic if Ollama unavailable.
     """
+    # Always use Python for keyword/identifier searches — Ollama is unreliable for filtering
+    if _is_keyword_search(question):
+        return _fallback_ai_query(question, decoded_params, session_info)
+
+    # Natural language → try Ollama first
     result = _try_ollama_ai_query(question, decoded_params, session_info, model, host)
     if result is not None:
+        # Safety: verify Ollama's matched_qualifiers with Python too
+        if result.get("query_type") == "keyword_filter":
+            result["matched_qualifiers"] = _python_verify_qualifiers(
+                question, result["matched_qualifiers"], decoded_params
+            )
         return result["answer"], result["matched_qualifiers"], result["query_type"], "ollama"
 
-    # Deterministic fallback
     return _fallback_ai_query(question, decoded_params, session_info)
+
+
+def _python_verify_qualifiers(
+    question: str,
+    candidates: list[str],
+    decoded_params: list[dict],
+) -> list[str]:
+    """Cross-check Ollama's qualifier list with Python to remove hallucinated matches."""
+    q = question.lower()
+    tokens = [t for t in re.split(r"[\s_]+", q) if len(t) >= 3]
+    search_terms = list({q} | set(tokens))
+    param_map = {p["qualifier"]: p for p in decoded_params}
+    return [
+        qname for qname in candidates
+        if qname in param_map and all(
+            t in " ".join([
+                qname.lower(),
+                param_map[qname]["field"].lower(),
+                param_map[qname].get("domain",   "").lower(),
+                param_map[qname].get("fragment", "").lower(),
+                param_map[qname].get("feature",  "").lower(),
+            ])
+            for t in search_terms
+        )
+    ]
 
 
 def _try_ollama_ai_query(
@@ -267,7 +317,6 @@ def _try_ollama_ai_query(
         return None
 
 
-_SHOW_ALL_WORDS    = {"all", "everything", "full", "list", "summary", "show", "complete"}
 _SESSION_INFO_WORDS = {"variant", "ecu", "version", "header", "app", "session", "cbf"}
 
 
@@ -278,14 +327,7 @@ def _fallback_ai_query(
 ) -> tuple[str, list[str], str, str]:
     """Rule-based fallback when Ollama is not available."""
     q = question.lower().strip()
-    # Use WHOLE-WORD sets — never substring — so "installed" doesn't trigger "all"
     q_words = set(q.split())
-
-    # show_all — only if the user literally typed one of these words
-    if q_words & _SHOW_ALL_WORDS:
-        lines = [f"- **{p['field']}** (`{p['qualifier']}`): hex `{p['hex']}` → **{p['decimal']}**"
-                 for p in decoded_params]
-        return "**All parameters:**\n\n" + "\n".join(lines), [], "show_all", "fallback"
 
     # session_info
     if q_words & _SESSION_INFO_WORDS:
