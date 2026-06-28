@@ -137,3 +137,103 @@ def _normalize_feature(raw: str) -> str:
         if raw.endswith(known):
             return known
     return raw
+
+
+# ---------- Q&A for decoded .par files ----------
+
+_QA_SYSTEM = (
+    "You are an expert automotive ECU configuration analyst. "
+    "The user has loaded a .par ECU configuration file. "
+    "Here is the fully decoded configuration:\n\n"
+    "{context}\n\n"
+    "Answer the user's question about this configuration clearly and concisely. "
+    "Only use information from the decoded configuration above. "
+    "If something is not in the data, say so honestly."
+)
+
+
+def answer_question(
+    question: str,
+    context_text: str,
+    model: str = "qwen2.5:7b",
+    host: str | None = None,
+) -> tuple[str, str]:
+    """Return (answer, source) where source is 'ollama' or 'fallback'."""
+    answer = _try_ollama_qa(question, context_text, model, host)
+    if answer is not None:
+        return answer, "ollama"
+    return _fallback_qa(question, context_text), "fallback"
+
+
+def _try_ollama_qa(question: str, context_text: str, model: str, host: str | None) -> str | None:
+    if OllamaClient is None:
+        return None
+    try:
+        client = OllamaClient(host=host) if host else OllamaClient()
+        resp = client.chat(
+            model=model,
+            messages=[
+                {"role": "system", "content": _QA_SYSTEM.format(context=context_text)},
+                {"role": "user", "content": question},
+            ],
+            options={"temperature": 0.2},
+        )
+        return resp["message"]["content"].strip()
+    except Exception:
+        return None
+
+
+def _fallback_qa(question: str, context_text: str) -> str:
+    """Keyword search over the context text when Ollama isn't available."""
+    q = question.lower()
+    lines = [l for l in context_text.splitlines() if l.strip()]
+
+    # Check for broad queries first
+    if any(w in q for w in ("all", "everything", "full", "list", "summary", "explain", "show", "complete")):
+        param_lines = [l for l in lines if "hex=" in l]
+        if not param_lines:
+            return "No decoded parameters available."
+        bullets = []
+        for l in param_lines:
+            # format: "  Feature (qualifier): VALUE  [hex=...]"
+            stripped = l.strip()
+            colon_idx = stripped.find(":")
+            bracket_idx = stripped.find("[")
+            if colon_idx > 0 and bracket_idx > 0:
+                label = stripped[:colon_idx].strip()
+                value = stripped[colon_idx + 1:bracket_idx].strip()
+                bullets.append(f"- **{label}**: {value}")
+            else:
+                bullets.append(f"- {stripped}")
+        return "**Full decoded configuration:**\n\n" + "\n".join(bullets)
+
+    if any(w in q for w in ("variant", "ecu", "version", "header", "app", "session", "cbf", "sapi")):
+        info_lines = [l for l in lines if "hex=" not in l and l.strip() and not l.startswith("===")]
+        if info_lines:
+            return "**ECU / Session Information:**\n\n" + "\n".join(f"- {l.strip()}" for l in info_lines)
+
+    # Keyword search across parameter lines
+    param_lines = [l for l in lines if "hex=" in l]
+    matches = [l for l in param_lines if any(word in l.lower() for word in q.split() if len(word) > 2)]
+
+    if matches:
+        result_parts = []
+        for l in matches:
+            stripped = l.strip()
+            colon_idx = stripped.find(":")
+            bracket_idx = stripped.find("[")
+            if colon_idx > 0 and bracket_idx > 0:
+                label = stripped[:colon_idx].strip()
+                value = stripped[colon_idx + 1:bracket_idx].strip()
+                meta = stripped[bracket_idx:].strip("[]")
+                result_parts.append(f"**{label}**\n- Value: **{value}**\n- {meta}")
+            else:
+                result_parts.append(stripped)
+        return "\n\n".join(result_parts)
+
+    return (
+        "I couldn't find a specific match. Try:\n"
+        "- **'show all'** — full configuration\n"
+        "- **'What is the drive side?'** — specific feature\n"
+        "- **'What variant is this?'** — ECU / session info"
+    )

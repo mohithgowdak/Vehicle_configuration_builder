@@ -117,7 +117,14 @@ def load_reference_par(path: Path | None) -> ParHeader:
                 "H,CBFVERSION,04.03.80",
                 "H,QUALIFIERFORMAT,MCD",
             ],
-            default_params=[],
+            default_params=[
+                "P,VCD_CGW_BKAM_Timer.Timeout_Value,B,4B",
+                "P,VCD_CGW_TrackWidth.Value,W,09FE",
+                "P,VCD_CGW_TPM.Type,B,02",
+                "P,VCD_CGW_BrakeSystem.Config,B,03",
+                "P,VCD_CGW_Drive.Side,B,00",
+                "P,VCD_CGW_Steering.Variant,B,11",
+            ],
         )
     text = path.read_text(encoding="utf-8", errors="ignore").splitlines()
     s, h, p = [], [], []
@@ -203,3 +210,6 @@ NOMENCLATURE_TO_QUALIFIER: dict[str, str] = {
     "DRIVE":       "VCD_CGW_Drive.Side",
     "STEERPARA":   "VCD_CGW_Steering.Variant",
 }
+
+# Reverse map: CDD qualifier → human-readable feature name.
+QUALIFIER_TO_FEATURE: dict[str, str] = {v: k for k, v in NOMENCLATURE_TO_QUALIFIER.items()}
