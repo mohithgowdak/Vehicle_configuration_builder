@@ -12,6 +12,7 @@ load_dotenv()
 @dataclass(frozen=True)
 class Settings:
     part_number_xlsx: Path | None
+    param_values_xlsx: Path | None          # second Excel: parameter values / qualifier map
     cdd_xlsx: Path | None
     cdd_xml: Path | None
     reference_par: Path | None
@@ -30,11 +31,12 @@ class Settings:
         out = _path("OUTPUT_DIR") or Path("out")
         out.mkdir(parents=True, exist_ok=True)
         try:
-            overlay = float(os.getenv("BACKGROUND_OVERLAY", "0.55"))
+            overlay = float(os.getenv("BACKGROUND_OVERLAY", "0.55").split()[0])
         except ValueError:
             overlay = 0.55
         return cls(
             part_number_xlsx=_path("PART_NUMBER_XLSX"),
+            param_values_xlsx=_path("PARAM_VALUES_XLSX"),
             cdd_xlsx=_path("CDD_XLSX"),
             cdd_xml=_path("CDD_XML"),
             reference_par=_path("REFERENCE_PAR"),
@@ -53,7 +55,6 @@ class Settings:
 
         return {
             "Part Number xlsx": check(self.part_number_xlsx),
-            "CDD xlsx": check(self.cdd_xlsx),
-            "CDD xml": check(self.cdd_xml),
-            "Reference .par": check(self.reference_par),
+            "Param Values xlsx": check(self.param_values_xlsx),
+            "Reference .par":    check(self.reference_par),
         }

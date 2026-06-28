@@ -237,6 +237,10 @@ if "pending_prompt" not in st.session_state:
     st.session_state.pending_prompt = None
 if "part_df" not in st.session_state:
     st.session_state.part_df = None
+if "param_df" not in st.session_state:
+    st.session_state.param_df = None
+if "qualifier_bridge" not in st.session_state:
+    st.session_state.qualifier_bridge = {}
 
 settings: Settings = st.session_state.settings
 
@@ -246,19 +250,32 @@ settings: Settings = st.session_state.settings
 # -------------------------------------------------------------------------- #
 
 @st.cache_resource
-def _load_cdd_and_parts(cdd_xlsx, cdd_xml, pn_xlsx):
-    cdd = dl.load_cdd(cdd_xlsx, cdd_xml)
-    part_df = dl.load_part_numbers(pn_xlsx)
-    return cdd, part_df
+def _load_all_data(cdd_xlsx, cdd_xml, pn_xlsx, pv_xlsx):
+    cdd      = dl.load_cdd(cdd_xlsx, cdd_xml)
+    part_df  = dl.load_part_numbers(pn_xlsx)
+    param_df = dl.load_param_values(pv_xlsx)
+    return cdd, part_df, param_df
 
 
 def _do_decode(par_text: str, filename: str) -> None:
     """Parse + decode a .par text block and store results in session state."""
-    cdd, part_df = _load_cdd_and_parts(
-        settings.cdd_xlsx, settings.cdd_xml, settings.part_number_xlsx
+    cdd, part_df, param_df = _load_all_data(
+        settings.cdd_xlsx, settings.cdd_xml,
+        settings.part_number_xlsx, settings.param_values_xlsx,
     )
     header = parse_par_text(par_text)
-    decoded = decode_par_file(header, cdd, dl.QUALIFIER_TO_FEATURE)
+
+    # Build dynamic qualifier map from both Excels first
+    par_qualifiers = [
+        ln.split(",")[1].strip()
+        for ln in header.default_params
+        if ln.startswith("P,") and len(ln.split(",")) >= 2
+    ]
+    bridge = dl.build_qualifier_bridge(par_qualifiers, part_df, param_df)
+    # Merge bridge feature names into QUALIFIER_TO_FEATURE for the decoder
+    q_to_feature = {**dl.QUALIFIER_TO_FEATURE, **{q: v["feature"] for q, v in bridge.items() if v["feature"]}}
+
+    decoded = decode_par_file(header, cdd, q_to_feature)
     session_info = extract_session_info(header)
 
     st.session_state.decoded_params = decoded
@@ -266,6 +283,8 @@ def _do_decode(par_text: str, filename: str) -> None:
     st.session_state.par_filename = filename
     st.session_state.par_raw_text = par_text
     st.session_state.part_df = part_df
+    st.session_state.param_df = param_df
+    st.session_state.qualifier_bridge = bridge
     st.session_state.messages = []
 
 
@@ -273,8 +292,9 @@ def _auto_load_reference_par() -> None:
     """Load the reference .par from settings on first run."""
     if st.session_state.decoded_params is not None:
         return
-    cdd, part_df = _load_cdd_and_parts(
-        settings.cdd_xlsx, settings.cdd_xml, settings.part_number_xlsx
+    cdd, part_df, param_df = _load_all_data(
+        settings.cdd_xlsx, settings.cdd_xml,
+        settings.part_number_xlsx, settings.param_values_xlsx,
     )
     if settings.reference_par and settings.reference_par.exists():
         text = settings.reference_par.read_text(encoding="utf-8", errors="ignore")
@@ -286,7 +306,15 @@ def _auto_load_reference_par() -> None:
         filename = "demo_sample.par (built-in)"
         text = "\n".join(header.session_lines + header.header_lines + header.default_params)
 
-    decoded = decode_par_file(header, cdd, dl.QUALIFIER_TO_FEATURE)
+    par_qualifiers = [
+        ln.split(",")[1].strip()
+        for ln in header.default_params
+        if ln.startswith("P,") and len(ln.split(",")) >= 2
+    ]
+    bridge = dl.build_qualifier_bridge(par_qualifiers, part_df, param_df)
+    q_to_feature = {**dl.QUALIFIER_TO_FEATURE, **{q: v["feature"] for q, v in bridge.items() if v["feature"]}}
+
+    decoded = decode_par_file(header, cdd, q_to_feature)
     session_info = extract_session_info(header)
 
     st.session_state.decoded_params = decoded
@@ -294,6 +322,8 @@ def _auto_load_reference_par() -> None:
     st.session_state.par_filename = filename
     st.session_state.par_raw_text = text
     st.session_state.part_df = part_df
+    st.session_state.param_df = param_df
+    st.session_state.qualifier_bridge = bridge
 
 
 def _answer_part_number(part_num: str, decoded: list[DecodedParam], part_df) -> str:
@@ -358,13 +388,39 @@ with st.sidebar:
             unsafe_allow_html=True,
         )
 
-    # Show column names detected from the real Excel so user can verify
-    part_df_check = st.session_state.get("part_df")
-    if part_df_check is not None and len(part_df_check.columns) > 0:
-        with st.expander("📊 Excel columns detected", expanded=False):
-            st.caption("Columns found in Part Number xlsx:")
-            st.code(", ".join(part_df_check.columns.tolist()))
-            st.caption(f"{len(part_df_check)} rows loaded")
+    # Excel inspector — shows columns + sample rows from both files
+    part_df_sb  = st.session_state.get("part_df")
+    param_df_sb = st.session_state.get("param_df")
+    bridge_sb   = st.session_state.get("qualifier_bridge", {})
+
+    with st.expander("📊 Excel Inspector", expanded=False):
+        if part_df_sb is not None:
+            st.caption(f"**Config_Partnumbers** — {len(part_df_sb)} rows")
+            st.code(", ".join(part_df_sb.columns.tolist()))
+            st.dataframe(part_df_sb.head(3), use_container_width=True, hide_index=True)
+        else:
+            st.caption("Part Number xlsx not loaded")
+
+        if param_df_sb is not None:
+            st.caption(f"**Param Values** — {len(param_df_sb)} rows")
+            st.code(", ".join(param_df_sb.columns.tolist()))
+            st.dataframe(param_df_sb.head(3), use_container_width=True, hide_index=True)
+        else:
+            st.caption("Param Values xlsx not loaded / not set in .env")
+
+    with st.expander("🔗 Qualifier mapping", expanded=False):
+        if bridge_sb:
+            for q, info in bridge_sb.items():
+                icon = "✓" if info["feature"] else "○"
+                st.markdown(
+                    f'<div class="pill {"ok" if info["feature"] else "warn"}">'
+                    f'{icon} {q.split(".")[-1]}</div>'
+                    f'<div style="font-size:0.7rem;color:#64748b;margin:-2px 0 6px 4px;">'
+                    f'→ {info["feature"] or "no match"} ({info["source"]})</div>',
+                    unsafe_allow_html=True,
+                )
+        else:
+            st.caption("No qualifiers mapped yet")
 
     st.divider()
     st.markdown("### Try it")

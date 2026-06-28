@@ -107,6 +107,124 @@ def _cdd_from_xlsx(path: Path) -> dict[str, ParamSpec]:
     return out
 
 
+# ---------- Parameter Values (second Excel) ----------
+
+def load_param_values(path: Path | None) -> pd.DataFrame | None:
+    """Load the second Excel (partnumber_parameter_values). Returns None if not found."""
+    if not path or not path.exists():
+        return None
+    df = pd.read_excel(path)
+    df.columns = [str(c).strip() for c in df.columns]
+    return df
+
+
+def build_qualifier_bridge(
+    par_qualifiers: list[str],
+    part_df: pd.DataFrame,
+    param_df: pd.DataFrame | None,
+) -> dict[str, dict]:
+    """
+    Try to map each .par qualifier to a row in the Excel files.
+
+    Returns dict[qualifier] = {
+        "feature": str,       # human-readable name
+        "part_number": str,
+        "nomenclature": str,
+        "source": str,        # which strategy found it
+        "row": dict,          # raw row for display
+    }
+    """
+    bridge: dict[str, dict] = {}
+
+    # ---- Strategy 1: param_df has a column whose values match par qualifiers ----
+    if param_df is not None:
+        for col in param_df.columns:
+            col_vals = param_df[col].astype(str).str.strip()
+            for q in par_qualifiers:
+                if q in bridge:
+                    continue
+                matches = param_df[col_vals == q]
+                if not matches.empty:
+                    row = matches.iloc[0]
+                    nom_col = _find_col(param_df, _NOM_COLS)
+                    pn_col  = _find_col(param_df, _PN_COLS)
+                    bridge[q] = {
+                        "feature":      str(row[nom_col]).strip() if nom_col else "",
+                        "part_number":  str(row[pn_col]).strip()  if pn_col  else "",
+                        "nomenclature": str(row[nom_col]).strip() if nom_col else "",
+                        "source":       f"param_values[{col}]",
+                        "row":          row.to_dict(),
+                    }
+
+    # ---- Strategy 2: match tail of qualifier against any column value in param_df ----
+    if param_df is not None:
+        for q in par_qualifiers:
+            if q in bridge:
+                continue
+            tail = q.split(".")[-1]   # e.g. "Timeout_Value"
+            for col in param_df.columns:
+                col_vals = param_df[col].astype(str).str.strip()
+                matches = param_df[col_vals.str.lower() == tail.lower()]
+                if not matches.empty:
+                    row = matches.iloc[0]
+                    nom_col = _find_col(param_df, _NOM_COLS)
+                    pn_col  = _find_col(param_df, _PN_COLS)
+                    bridge[q] = {
+                        "feature":      str(row[nom_col]).strip() if nom_col else tail,
+                        "part_number":  str(row[pn_col]).strip()  if pn_col  else "",
+                        "nomenclature": str(row[nom_col]).strip() if nom_col else "",
+                        "source":       f"tail-match[{col}]",
+                        "row":          row.to_dict(),
+                    }
+                    break
+
+    # ---- Strategy 3: link via part_number shared between both Excels ----
+    if param_df is not None:
+        pn_col_part   = _find_col(part_df, _PN_COLS)
+        pn_col_param  = _find_col(param_df, _PN_COLS)
+        q_col_param   = _find_col(param_df, ["Qualifier", "ECU Qualifier", "CDD Qualifier",
+                                              "Parameter", "QualifierName", "Param"])
+        if pn_col_part and pn_col_param and q_col_param:
+            for q in par_qualifiers:
+                if q in bridge:
+                    continue
+                # Find rows in param_df whose qualifier column matches q
+                matches_param = param_df[
+                    param_df[q_col_param].astype(str).str.strip() == q
+                ]
+                if matches_param.empty:
+                    continue
+                pn = str(matches_param.iloc[0][pn_col_param]).strip()
+                # Find that part number in part_df
+                matches_part = part_df[
+                    part_df[pn_col_part].astype(str).str.strip() == pn
+                ]
+                nom_col = _find_col(part_df, _NOM_COLS)
+                feature = ""
+                if not matches_part.empty and nom_col:
+                    feature = str(matches_part.iloc[0][nom_col]).strip()
+                bridge[q] = {
+                    "feature":      feature,
+                    "part_number":  pn,
+                    "nomenclature": feature,
+                    "source":       "part_number-bridge",
+                    "row":          matches_param.iloc[0].to_dict(),
+                }
+
+    # ---- Strategy 4: hardcoded fallback ----
+    for q in par_qualifiers:
+        if q not in bridge and q in QUALIFIER_TO_FEATURE:
+            bridge[q] = {
+                "feature":      QUALIFIER_TO_FEATURE[q],
+                "part_number":  "",
+                "nomenclature": QUALIFIER_TO_FEATURE[q],
+                "source":       "built-in map",
+                "row":          {},
+            }
+
+    return bridge
+
+
 # ---------- Reference .par ----------
 
 def load_reference_par(path: Path | None) -> ParHeader:
