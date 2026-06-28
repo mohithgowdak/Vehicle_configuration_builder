@@ -171,39 +171,39 @@ def build_qualifier_bridge(
     nom_col_part  = _find_col(part_df,  _NOM_COLS)
 
     # ---- Strategy 1 (primary): normalized Domain ↔ qualifier group fuzzy match ----
-    # Strips VCD_/CGW_/VCD_CGW_ prefixes from both sides before comparing so that
-    # "CGW_Third Party PT Config Write" matches "VCD_Third_Party_PT_Config"
+    # Uses vectorised pandas — no iterrows — so it stays fast even on large files.
     if param_df is not None and domain_col:
-        # Pre-build: normalized_key → list of param_df rows
-        norm_to_rows: dict[str, list] = {}
-        for _, row in param_df.iterrows():
-            dom = str(row[domain_col]).strip()
-            if not dom or dom.lower() == "nan":
-                continue
-            norm_to_rows.setdefault(_norm_key(dom), []).append(row)
+        # Vectorised: compute norm key for every domain row at once
+        _pv = param_df.copy()
+        _pv["_norm"] = (
+            _pv[domain_col]
+            .astype(str).str.strip()
+            .apply(_norm_key)
+        )
+        # Keep first occurrence per norm key
+        _pv_dedup = _pv.drop_duplicates(subset="_norm").set_index("_norm")
 
-        # Pre-build: no-dots part number → Config_Partnumbers nomenclature
+        # Vectorised: no-dots part number → nomenclature from Config_Partnumbers
         pn_to_nom: dict[str, str] = {}
         if pn_col_part and nom_col_part:
-            for _, pr in part_df.iterrows():
-                pn = pn_strip_dots(str(pr[pn_col_part]))
-                nom = str(pr[nom_col_part]).strip()
-                if pn and nom and nom.lower() != "nan":
-                    pn_to_nom[pn] = nom
+            _pt = part_df.copy()
+            _pt["_pn_nd"] = _pt[pn_col_part].astype(str).apply(pn_strip_dots)
+            _pt_map = _pt.dropna(subset=[nom_col_part])
+            _pt_map = _pt_map[_pt_map[nom_col_part].astype(str).str.lower() != "nan"]
+            pn_to_nom = dict(zip(_pt_map["_pn_nd"], _pt_map[nom_col_part].astype(str)))
 
         for q in par_qualifiers:
             if q in bridge:
                 continue
-            q_group = q.split(".")[0]          # e.g. "VCD_Third_Party_PT_Config"
-            q_norm  = _norm_key(q_group)       # e.g. "thirdpartyptconfig"
-            rows = norm_to_rows.get(q_norm)
-            if not rows:
+            q_group = q.split(".")[0]
+            q_norm  = _norm_key(q_group)
+            if q_norm not in _pv_dedup.index:
                 continue
-            row = rows[0]
+            row = _pv_dedup.loc[q_norm]
             dom      = str(row[domain_col]).strip()
-            fragment = str(row[fragment_col]).strip() if fragment_col else ""
-            pval     = str(row[pval_col]).strip()     if pval_col    else ""
-            pn_raw   = str(row[pn_col_param]).strip() if pn_col_param else ""
+            fragment = str(row[fragment_col]).strip() if fragment_col and fragment_col in row.index else ""
+            pval     = str(row[pval_col]).strip()     if pval_col    and pval_col    in row.index else ""
+            pn_raw   = str(row[pn_col_param]).strip() if pn_col_param and pn_col_param in row.index else ""
             pn_nodot = pn_strip_dots(pn_raw)
 
             nom_from_part = pn_to_nom.get(pn_nodot, "")
@@ -255,11 +255,9 @@ def find_par_qualifiers_for_part_number(
     if not domain_col or not pn_col_param:
         return []
 
-    # Normalise both sides to no-dots before comparing:
-    #   Config_Partnumbers: "A.034.447.29.27" → pn_strip_dots → "A0344472927"
-    #   Param_values:       "A0344472927"     → pn_strip_dots → "A0344472927"  (no-op)
+    # Normalise both sides: remove dots so "A.034.447.29.27" == "A0344472927"
     matches = param_df[
-        param_df[pn_col_param].astype(str).apply(pn_strip_dots) == pn_nodot
+        param_df[pn_col_param].astype(str).str.replace(".", "", regex=False).str.strip() == pn_nodot
     ]
     if matches.empty:
         return []

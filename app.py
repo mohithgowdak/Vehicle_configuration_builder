@@ -263,6 +263,8 @@ def _load_all_data(cdd_xlsx, cdd_xml, pn_xlsx, pv_xlsx):
     return cdd, part_df, param_df
 
 
+
+
 def _do_decode(par_text: str, filename: str) -> None:
     """Parse + decode a .par text block and store results in session state."""
     cdd, part_df, param_df = _load_all_data(
@@ -456,19 +458,36 @@ with st.sidebar:
         else:
             st.caption("Param Values xlsx not loaded / not set in .env")
 
-    with st.expander("🔗 Qualifier mapping", expanded=False):
-        if bridge_sb:
-            for q, info in bridge_sb.items():
-                icon = "✓" if info["feature"] else "○"
-                st.markdown(
-                    f'<div class="pill {"ok" if info["feature"] else "warn"}">'
-                    f'{icon} {q.split(".")[-1]}</div>'
-                    f'<div style="font-size:0.7rem;color:#64748b;margin:-2px 0 6px 4px;">'
-                    f'→ {info["feature"] or "no match"} ({info["source"]})</div>',
-                    unsafe_allow_html=True,
-                )
-        else:
-            st.caption("No qualifiers mapped yet")
+    with st.expander("🔗 Qualifier mapping debug", expanded=False):
+        _pdf = st.session_state.get("param_df")
+        if _pdf is not None:
+            from core.data_loader import _find_col, _DOMAIN_COLS, _FRAGMENT_COLS, _norm_key
+            _dcol = _find_col(_pdf, _DOMAIN_COLS)
+            _fcol = _find_col(_pdf, _FRAGMENT_COLS)
+            st.caption(f"Domain column detected: **`{_dcol}`**")
+            st.caption(f"Fragment column detected: **`{_fcol}`**")
+            st.caption(f"All columns in param_values: `{list(_pdf.columns)}`")
+            if _dcol:
+                _doms = _pdf[_dcol].dropna().astype(str).str.strip().unique()[:5]
+                st.caption("Sample domains & their norm keys:")
+                for _d in _doms:
+                    st.code(f"{_d!r:45s} → {_norm_key(_d)!r}")
+        _dec = st.session_state.get("decoded_params")
+        if _dec:
+            _grps = list({p.qualifier.split(".")[0] for p in _dec})[:5]
+            st.caption("Sample PAR qualifier groups & norm keys:")
+            for _g in _grps:
+                st.code(f"{_g!r:45s} → {_norm_key(_g)!r}")
+        _br = st.session_state.get("qualifier_bridge", {})
+        matched   = sum(1 for v in _br.values() if v.get("domain"))
+        unmatched = len(_br) - matched
+        st.caption(f"Bridge: **{matched} matched** / {unmatched} unmatched out of {len(_br)} qualifiers")
+
+    if st.button("🔄 Force rebuild mapping", use_container_width=True):
+        st.session_state.decoded_params = None
+        st.session_state.qualifier_bridge = {}
+        st.cache_resource.clear()
+        st.rerun()
 
     st.divider()
     st.markdown("### Try it")
