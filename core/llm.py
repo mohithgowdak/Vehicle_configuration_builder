@@ -202,18 +202,23 @@ _AI_RESPONSE_SCHEMA = {
 
 
 def _is_keyword_search(text: str) -> bool:
-    """True when the input is a plain keyword/identifier, not a natural-language question."""
+    """True only when input looks like a single identifier/keyword.
+
+    Multi-word inputs almost always go to Ollama. Only short single-token
+    technical identifiers (clcs_installed, hvac, tpm) stay in Python.
+    """
     text = text.strip()
     if "?" in text:
         return False
     words = text.lower().split()
+    if len(words) >= 2:
+        return False  # multi-word → let Ollama handle it
     question_words = {"what", "how", "why", "which", "when", "where",
                       "is", "are", "can", "does", "do", "tell", "give",
                       "show", "list", "explain", "describe", "find"}
-    # If it contains question words or is longer than 4 words, treat as NL question
-    if set(words) & question_words:
+    if words and words[0] in question_words:
         return False
-    return len(words) <= 4
+    return True
 
 
 def ai_query(
@@ -271,6 +276,9 @@ def _python_verify_qualifiers(
     ]
 
 
+LAST_OLLAMA_ERROR: str = ""   # surfaced to the UI so failures are visible
+
+
 def _try_ollama_ai_query(
     question: str,
     decoded_params: list[dict],
@@ -278,10 +286,14 @@ def _try_ollama_ai_query(
     model: str,
     host: str | None,
 ) -> dict | None:
+    global LAST_OLLAMA_ERROR
     if OllamaClient is None:
+        LAST_OLLAMA_ERROR = "ollama python package not installed (pip install ollama)"
         return None
     try:
-        # Keep params compact — only include fields the model needs
+        # Keep param payload bounded — most NL questions need at most a few hundred
+        # rows of context; sending 5000 rows can stall a 7B model for 60+ seconds.
+        MAX_PARAMS = 250
         compact = [
             {
                 "qualifier": p["qualifier"],
@@ -292,7 +304,7 @@ def _try_ollama_ai_query(
                 "fragment":  p.get("fragment", ""),
                 "feature":   p.get("feature", ""),
             }
-            for p in decoded_params
+            for p in decoded_params[:MAX_PARAMS]
         ]
         system = _AI_QUERY_SYSTEM.format(
             params_json=json.dumps(compact, indent=2),
@@ -309,12 +321,28 @@ def _try_ollama_ai_query(
             options={"temperature": 0},
         )
         data = json.loads(resp["message"]["content"])
-        # Validate matched_qualifiers are real qualifiers
         valid_qs = {p["qualifier"] for p in decoded_params}
         data["matched_qualifiers"] = [q for q in data.get("matched_qualifiers", []) if q in valid_qs]
+        LAST_OLLAMA_ERROR = ""
         return data
-    except Exception:
+    except Exception as exc:
+        LAST_OLLAMA_ERROR = f"{type(exc).__name__}: {exc}"
         return None
+
+
+def ollama_status(model: str = "qwen2.5:7b", host: str | None = None) -> tuple[bool, str]:
+    """Quick ping to see whether Ollama is reachable AND has the model loaded."""
+    if OllamaClient is None:
+        return False, "ollama package not installed"
+    try:
+        client = OllamaClient(host=host) if host else OllamaClient()
+        models = client.list().get("models", [])
+        names = [m.get("name", m.get("model", "")) for m in models]
+        if not any(model.split(":")[0] in n for n in names):
+            return False, f"connected, but model '{model}' not pulled — run `ollama pull {model}`"
+        return True, f"connected · models: {len(names)} · using {model}"
+    except Exception as exc:
+        return False, f"unreachable: {type(exc).__name__}: {exc}"
 
 
 _SESSION_INFO_WORDS = {"variant", "ecu", "version", "header", "app", "session", "cbf"}

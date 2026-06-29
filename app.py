@@ -26,10 +26,13 @@ from core.decoder import (
 )
 from core.data_loader import find_par_qualifiers_for_part_number, pn_strip_dots
 try:
-    from core.llm import ai_query, answer_question
+    from core.llm import ai_query, answer_question, ollama_status
+    import core.llm as _llm_mod
 except ImportError:
     from core.llm import answer_question          # older version of llm.py
     ai_query = None  # type: ignore
+    ollama_status = None  # type: ignore
+    _llm_mod = None  # type: ignore
 
 
 # -------------------------------------------------------------------------- #
@@ -487,6 +490,28 @@ with st.sidebar:
             f'<div class="pill {css}">{icon} {label}{note}</div>',
             unsafe_allow_html=True,
         )
+
+    # --- Ollama live status ---
+    st.markdown("### LLM Engine")
+    if ollama_status is not None:
+        _ok, _msg = ollama_status(settings.ollama_model, settings.ollama_host)
+        _css  = "ok" if _ok else "err"
+        _icon = "🟢" if _ok else "🔴"
+        st.markdown(
+            f'<div class="pill {_css}">{_icon} Ollama · {settings.ollama_model}</div>'
+            f'<div style="font-size:0.7rem;color:#64748b;margin:-2px 0 6px 4px;">{_msg}</div>',
+            unsafe_allow_html=True,
+        )
+        # Show the most recent Ollama error if any
+        _last_err = getattr(_llm_mod, "LAST_OLLAMA_ERROR", "")
+        if _last_err:
+            st.markdown(
+                f'<div class="pill err">⚠️ Last error</div>'
+                f'<div style="font-size:0.7rem;color:#991b1b;margin:-2px 0 6px 4px;">{_last_err}</div>',
+                unsafe_allow_html=True,
+            )
+    else:
+        st.caption("ollama package not installed")
 
     # Excel inspector — shows columns + sample rows from both files
     part_df_sb  = st.session_state.get("part_df")
